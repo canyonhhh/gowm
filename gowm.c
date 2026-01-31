@@ -28,6 +28,58 @@ static int find_empty_ws(void)
     return -1;
 }
 
+static void focus_window(Display *dpy, Window w)
+{
+    if (w == None) return;
+    XMapRaised(dpy, w);
+    XSetInputFocus(dpy, w, RevertToPointerRoot, CurrentTime);
+}
+
+static void switch_ws(Display *dpy, int target)
+{
+    if (target == current_ws) return;
+
+    if (workspaces[current_ws] != None)
+        XUnmapWindow(dpy, workspaces[current_ws]);
+
+    current_ws = target;
+    focus_window(dpy, workspaces[current_ws]);
+}
+
+static void move_window_to_ws(Display *dpy, int target)
+{
+    if (target == current_ws) return;
+
+    Window w = workspaces[current_ws];
+    if (w == None) return;
+
+    if (workspaces[target] != None) return;
+
+    workspaces[current_ws] = None;
+    workspaces[target] = w;
+
+    focus_window(dpy, w);
+}
+
+static void handle_keypress(Display *dpy, XKeyEvent *ke)
+{
+    const KeySym sym = XLookupKeysym(ke, 0);
+    const unsigned int st = ke->state;
+
+    if (sym == XK_c && (st & ControlMask) && (st & ShiftMask)) {
+        running = 0;
+        return;
+    }
+
+    if (!(st & ControlMask)) return;
+    if (sym < XK_1 || sym > XK_9) return;
+
+    const int target = (int)(sym - XK_1);
+
+    if (st & ShiftMask) move_window_to_ws(dpy, target);
+    else               switch_ws(dpy, target);
+}
+
 int main(void)
 {
     Display *dpy;
@@ -79,57 +131,13 @@ int main(void)
     while (running) {
         XNextEvent(dpy, &ev);
 
-        if (ev.type == KeyPress) {
+        switch (ev.type) {
 
-            XKeyEvent *ke = &ev.xkey;
-            KeySym sym = XLookupKeysym(ke, 0);
+        case KeyPress:
+            handle_keypress(dpy, &ev.xkey);
+            break;
 
-            if ((ke->state & ControlMask) &&
-                sym >= XK_1 && sym <= XK_9) {
-
-                int target = sym - XK_1;
-
-                if (ke->state & ShiftMask) {
-                    Window w = workspaces[current_ws];
-
-                    if (w == None || target == current_ws)
-                        continue;
-
-                    workspaces[current_ws] = None;
-
-                    if (workspaces[target] != None) {
-                        continue;
-                    }
-
-                    workspaces[target] = w;
-
-                    XMapRaised(dpy, w);
-                    XSetInputFocus(dpy, w,
-                                   RevertToPointerRoot, CurrentTime);
-                }
-                else {
-                    if (target == current_ws)
-                        continue;
-
-                    if (workspaces[current_ws] != None) {
-                        XUnmapWindow(dpy, workspaces[current_ws]);
-                    }
-
-                    current_ws = target;
-
-                    if (workspaces[current_ws] != None) {
-                        Window w = workspaces[current_ws];
-                        XMapRaised(dpy, w);
-                        XSetInputFocus(dpy, w,
-                                       RevertToPointerRoot, CurrentTime);
-                    }
-                }
-            } else if (sym == XK_c &&
-                (ke->state & ControlMask) &&
-                (ke->state & ShiftMask)) {
-                running = 0;
-            }
-        } else if (ev.type == MapRequest) {
+        case MapRequest: {
             XMapRequestEvent *e = &ev.xmaprequest;
             Window w = e->window;
 
@@ -156,21 +164,26 @@ int main(void)
             }
 
             XSetInputFocus(dpy, w, RevertToPointerRoot, CurrentTime);
-        } else if (ev.type == DestroyNotify) {
+        } break;
+
+        case DestroyNotify: {
             XDestroyWindowEvent *e = &ev.xdestroywindow;
-
             if (e->window == workspaces[current_ws]) {
                 workspaces[current_ws] = None;
             }
-        } else if (ev.type == UnmapNotify) {
+        } break;
+
+        case UnmapNotify: {
             XUnmapEvent *e = &ev.xunmap;
-
             if (e->window == workspaces[current_ws]) {
                 workspaces[current_ws] = None;
             }
+        } break;
+
+        default:
+            break;
         }
     }
-
 
     for (int i = 0; i < NUM_WS; i++) {
         if (workspaces[i] != None) {

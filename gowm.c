@@ -13,6 +13,7 @@ static int current_ws = 0;
 
 static int xerror(Display *dpy, XErrorEvent *ee)
 {
+    (void)dpy;
     fprintf(stderr, "X error: request=%d error=%d\n",
             ee->request_code, ee->error_code);
     return 0;
@@ -25,16 +26,6 @@ static int find_empty_ws(void)
             return i;
     }
     return -1;
-}
-
-static void
-spawn(const char *cmd)
-{
-    if (fork() == 0) {
-        setsid();
-        execlp("sh", "sh", "-c", cmd, (char *)NULL);
-        _exit(127);
-    }
 }
 
 int main(void)
@@ -71,8 +62,9 @@ int main(void)
     XGrabKey(dpy, q, ControlMask | ShiftMask,
              root, True, GrabModeAsync, GrabModeAsync);
 
-    KeyCode p = XKeysymToKeycode(dpy, XK_p);
-    XGrabKey(dpy, p, ControlMask, root, True, GrabModeAsync, GrabModeAsync);
+    KeyCode c = XKeysymToKeycode(dpy, XK_C);
+    XGrabKey(dpy, c, ControlMask | ShiftMask,
+             root, True, GrabModeAsync, GrabModeAsync);
 
     for (int i = 0; i < NUM_WS; i++) {
         KeyCode kc = XKeysymToKeycode(dpy, XK_1 + i);
@@ -132,13 +124,10 @@ int main(void)
                                        RevertToPointerRoot, CurrentTime);
                     }
                 }
-            } else if (sym == XK_q &&
+            } else if (sym == XK_c &&
                 (ke->state & ControlMask) &&
                 (ke->state & ShiftMask)) {
                 running = 0;
-            } else if ((ke->state & ControlMask) && sym == XK_p) {
-                spawn("dmenu_run");
-                continue;
             }
         } else if (ev.type == MapRequest) {
             XMapRequestEvent *e = &ev.xmaprequest;

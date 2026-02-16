@@ -66,6 +66,15 @@ static void handle_keypress(Display *dpy, XKeyEvent *ke)
     const KeySym sym = XLookupKeysym(ke, 0);
     const unsigned int st = ke->state;
 
+    if (sym == XK_q && (st & ControlMask) && (st & ShiftMask)) {
+        Window w = workspaces[current_ws];
+        if (w != None) {
+            XKillClient(dpy, w);
+            workspaces[current_ws] = None;
+        }
+        return;
+    }
+
     if (sym == XK_c && (st & ControlMask) && (st & ShiftMask)) {
         running = 0;
         return;

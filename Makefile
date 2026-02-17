@@ -1,6 +1,6 @@
 CC      = cc
 CFLAGS  = -Wall -Wextra -O2
-LDFLAGS = -lX11
+LDFLAGS = -lX11 -lXinerama -lXrandr
 
 TARGET  = gowm
 SRC     = gowm.c

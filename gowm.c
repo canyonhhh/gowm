@@ -1,15 +1,33 @@
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
+#include <X11/extensions/Xinerama.h>
+#include <X11/extensions/Xrandr.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 
 #define NUM_WS 9
+#define NUM_MONITORS 2
+#define MAIN_OUTPUT_NAME "eDP-1"
 
 static int running = 1;
 static Window workspaces[NUM_WS];
-static int current_ws = 0;
+
+/* monitor 0 = main, monitor 1 = external (when connected) */
+static int monitor_count = 1;
+static int active_ws[NUM_MONITORS] = {0, 0};
+static int focused_ws = 0;
+
+struct monitor_geo {
+    int x;
+    int y;
+    int w;
+    int h;
+};
+
+static struct monitor_geo monitors[NUM_MONITORS];
 
 static int xerror(Display *dpy, XErrorEvent *ee)
 {
@@ -19,13 +37,16 @@ static int xerror(Display *dpy, XErrorEvent *ee)
     return 0;
 }
 
-static int find_empty_ws(void)
+static int is_external_workspace(int ws)
 {
-    for (int i = 0; i < NUM_WS; i++) {
-        if (workspaces[i] == None)
-            return i;
-    }
-    return -1;
+    return ws == 0 || ws == 7 || ws == 8;
+}
+
+static int workspace_monitor(int ws)
+{
+    if (monitor_count >= 2 && is_external_workspace(ws))
+        return 1;
+    return 0;
 }
 
 static void focus_window(Display *dpy, Window w)
@@ -35,30 +56,282 @@ static void focus_window(Display *dpy, Window w)
     XSetInputFocus(dpy, w, RevertToPointerRoot, CurrentTime);
 }
 
+static int find_workspace_by_window(Window w)
+{
+    for (int i = 0; i < NUM_WS; i++) {
+        if (workspaces[i] == w)
+            return i;
+    }
+    return -1;
+}
+
+static int find_empty_ws_for_monitor(int monitor)
+{
+    for (int i = 0; i < NUM_WS; i++) {
+        if (workspace_monitor(i) == monitor && workspaces[i] == None)
+            return i;
+    }
+    return -1;
+}
+
+static int overlap_area(int ax, int ay, int aw, int ah,
+                        int bx, int by, int bw, int bh)
+{
+    int x1 = (ax > bx) ? ax : bx;
+    int y1 = (ay > by) ? ay : by;
+    int x2 = ((ax + aw) < (bx + bw)) ? (ax + aw) : (bx + bw);
+    int y2 = ((ay + ah) < (by + bh)) ? (ay + ah) : (by + bh);
+
+    if (x2 <= x1 || y2 <= y1)
+        return 0;
+    return (x2 - x1) * (y2 - y1);
+}
+
+static int output_name_is_internal(const char *name)
+{
+    return strncmp(name, "eDP", 3) == 0 ||
+           strncmp(name, "LVDS", 4) == 0 ||
+           strncmp(name, "DSI", 3) == 0;
+}
+
+static void refresh_monitors(Display *dpy)
+{
+    int screen = DefaultScreen(dpy);
+    int sw = DisplayWidth(dpy, screen);
+    int sh = DisplayHeight(dpy, screen);
+
+    monitor_count = 1;
+    monitors[0].x = 0;
+    monitors[0].y = 0;
+    monitors[0].w = sw;
+    monitors[0].h = sh;
+
+    if (!XineramaIsActive(dpy))
+        return;
+
+    int n = 0;
+    XineramaScreenInfo *info = XineramaQueryScreens(dpy, &n);
+    if (!info || n < 2) {
+        if (info) XFree(info);
+        return;
+    }
+
+    int main_idx = 0;
+    int ext_idx = 1;
+
+    int main_x = 0, main_y = 0, main_w = 0, main_h = 0;
+    int have_main_rect = 0;
+
+    Window root = RootWindow(dpy, screen);
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(dpy, root);
+    if (res) {
+        const char *main_name = MAIN_OUTPUT_NAME;
+        RROutput primary = XRRGetOutputPrimary(dpy, root);
+        RROutput internal_candidate = None;
+
+        for (int i = 0; i < res->noutput; i++) {
+            RROutput out_id = res->outputs[i];
+            XRROutputInfo *out = XRRGetOutputInfo(dpy, res, out_id);
+            if (!out)
+                continue;
+
+            if (out->connection != RR_Connected || out->crtc == None) {
+                XRRFreeOutputInfo(out);
+                continue;
+            }
+
+            if (main_name && strcmp(main_name, out->name) == 0) {
+                XRRCrtcInfo *crtc = XRRGetCrtcInfo(dpy, res, out->crtc);
+                if (crtc) {
+                    main_x = crtc->x;
+                    main_y = crtc->y;
+                    main_w = (int)crtc->width;
+                    main_h = (int)crtc->height;
+                    have_main_rect = 1;
+                    XRRFreeCrtcInfo(crtc);
+                }
+                XRRFreeOutputInfo(out);
+                break;
+            }
+
+            if (!have_main_rect && out_id == primary) {
+                XRRCrtcInfo *crtc = XRRGetCrtcInfo(dpy, res, out->crtc);
+                if (crtc) {
+                    main_x = crtc->x;
+                    main_y = crtc->y;
+                    main_w = (int)crtc->width;
+                    main_h = (int)crtc->height;
+                    have_main_rect = 1;
+                    XRRFreeCrtcInfo(crtc);
+                }
+            }
+
+            if (internal_candidate == None && output_name_is_internal(out->name))
+                internal_candidate = out_id;
+
+            XRRFreeOutputInfo(out);
+        }
+
+        if (!have_main_rect && internal_candidate != None) {
+            XRROutputInfo *out = XRRGetOutputInfo(dpy, res, internal_candidate);
+            if (out && out->connection == RR_Connected && out->crtc != None) {
+                XRRCrtcInfo *crtc = XRRGetCrtcInfo(dpy, res, out->crtc);
+                if (crtc) {
+                    main_x = crtc->x;
+                    main_y = crtc->y;
+                    main_w = (int)crtc->width;
+                    main_h = (int)crtc->height;
+                    have_main_rect = 1;
+                    XRRFreeCrtcInfo(crtc);
+                }
+            }
+            if (out)
+                XRRFreeOutputInfo(out);
+        }
+
+        XRRFreeScreenResources(res);
+    }
+
+    if (have_main_rect) {
+        int best_overlap = -1;
+        for (int i = 0; i < n; i++) {
+            int ov = overlap_area(info[i].x_org, info[i].y_org,
+                                  info[i].width, info[i].height,
+                                  main_x, main_y, main_w, main_h);
+            if (ov > best_overlap) {
+                best_overlap = ov;
+                main_idx = i;
+            }
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (i != main_idx) {
+            ext_idx = i;
+            break;
+        }
+    }
+
+    if (ext_idx >= 0) {
+        monitor_count = 2;
+        monitors[0].x = info[main_idx].x_org;
+        monitors[0].y = info[main_idx].y_org;
+        monitors[0].w = info[main_idx].width;
+        monitors[0].h = info[main_idx].height;
+
+        monitors[1].x = info[ext_idx].x_org;
+        monitors[1].y = info[ext_idx].y_org;
+        monitors[1].w = info[ext_idx].width;
+        monitors[1].h = info[ext_idx].height;
+    }
+
+    XFree(info);
+}
+
+static void ensure_active_workspaces(void)
+{
+    if (monitor_count >= 2) {
+        if (workspace_monitor(active_ws[0]) != 0)
+            active_ws[0] = 1;
+        if (workspace_monitor(active_ws[1]) != 1)
+            active_ws[1] = 0;
+    } else {
+        active_ws[0] = focused_ws;
+    }
+}
+
+static int sync_monitors(Display *dpy)
+{
+    int prev_count = monitor_count;
+    struct monitor_geo prev_monitors[NUM_MONITORS] = { monitors[0], monitors[1] };
+    int prev_active_ws[NUM_MONITORS] = { active_ws[0], active_ws[1] };
+
+    refresh_monitors(dpy);
+    ensure_active_workspaces();
+
+    if (monitor_count != prev_count)
+        return 1;
+
+    for (int i = 0; i < NUM_MONITORS; i++) {
+        if (monitors[i].x != prev_monitors[i].x ||
+            monitors[i].y != prev_monitors[i].y ||
+            monitors[i].w != prev_monitors[i].w ||
+            monitors[i].h != prev_monitors[i].h)
+            return 1;
+    }
+
+    if (active_ws[0] != prev_active_ws[0] || active_ws[1] != prev_active_ws[1])
+        return 1;
+
+    return 0;
+}
+
+static void apply_layout(Display *dpy)
+{
+    for (int ws = 0; ws < NUM_WS; ws++) {
+        Window w = workspaces[ws];
+        if (w == None)
+            continue;
+
+        int mon = workspace_monitor(ws);
+        if (active_ws[mon] == ws) {
+            XMoveResizeWindow(dpy, w,
+                              monitors[mon].x,
+                              monitors[mon].y,
+                              (unsigned int)monitors[mon].w,
+                              (unsigned int)monitors[mon].h);
+            XMapWindow(dpy, w);
+            XRaiseWindow(dpy, w);
+        } else {
+            XUnmapWindow(dpy, w);
+        }
+    }
+}
+
+static void center_pointer_on_monitor(Display *dpy, int mon)
+{
+    Window root = DefaultRootWindow(dpy);
+    int cx = monitors[mon].x + monitors[mon].w / 2;
+    int cy = monitors[mon].y + monitors[mon].h / 2;
+    XWarpPointer(dpy, None, root, 0, 0, 0, 0, cx, cy);
+}
+
 static void switch_ws(Display *dpy, int target)
 {
-    if (target == current_ws) return;
+    int prev_mon = workspace_monitor(focused_ws);
+    int mon = workspace_monitor(target);
+    active_ws[mon] = target;
+    focused_ws = target;
 
-    if (workspaces[current_ws] != None)
-        XUnmapWindow(dpy, workspaces[current_ws]);
+    apply_layout(dpy);
+    focus_window(dpy, workspaces[target]);
 
-    current_ws = target;
-    focus_window(dpy, workspaces[current_ws]);
+    if (mon != prev_mon)
+        center_pointer_on_monitor(dpy, mon);
 }
 
 static void move_window_to_ws(Display *dpy, int target)
 {
-    if (target == current_ws) return;
+    if (target == focused_ws) return;
 
-    Window w = workspaces[current_ws];
-    if (w == None) return;
+    int src_ws = focused_ws;
+    Window src = workspaces[src_ws];
+    Window dst = workspaces[target];
+    if (src == None) return;
 
-    if (workspaces[target] != None) return;
+    workspaces[src_ws] = dst;
+    workspaces[target] = src;
 
-    workspaces[current_ws] = None;
-    workspaces[target] = w;
+    int src_mon = workspace_monitor(src_ws);
+    int mon = workspace_monitor(target);
+    active_ws[mon] = target;
+    focused_ws = target;
 
-    focus_window(dpy, w);
+    apply_layout(dpy);
+    focus_window(dpy, src);
+
+    if (dst != None)
+        active_ws[src_mon] = src_ws;
 }
 
 static void handle_keypress(Display *dpy, XKeyEvent *ke)
@@ -67,10 +340,11 @@ static void handle_keypress(Display *dpy, XKeyEvent *ke)
     const unsigned int st = ke->state;
 
     if (sym == XK_q && (st & ControlMask) && (st & ShiftMask)) {
-        Window w = workspaces[current_ws];
+        Window w = workspaces[focused_ws];
         if (w != None) {
             XKillClient(dpy, w);
-            workspaces[current_ws] = None;
+            workspaces[focused_ws] = None;
+            apply_layout(dpy);
         }
         return;
     }
@@ -94,9 +368,9 @@ int main(void)
     Display *dpy;
     Window root;
     XEvent ev;
-
-    int screen;
-    unsigned int sw, sh;
+    int rr_event_base = 0;
+    int rr_error_base = 0;
+    int have_randr = 0;
 
     dpy = XOpenDisplay(NULL);
     if (!dpy) {
@@ -109,13 +383,21 @@ int main(void)
 
     root = DefaultRootWindow(dpy);
 
-    screen = DefaultScreen(dpy);
-    sw = DisplayWidth(dpy, screen);
-    sh = DisplayHeight(dpy, screen);
+    refresh_monitors(dpy);
+    ensure_active_workspaces();
 
     XSetErrorHandler(xerror);
     XSelectInput(dpy, root,
         SubstructureRedirectMask | SubstructureNotifyMask);
+
+    have_randr = XRRQueryExtension(dpy, &rr_event_base, &rr_error_base);
+    if (have_randr) {
+        XRRSelectInput(dpy, root,
+                       RRScreenChangeNotifyMask |
+                       RRCrtcChangeNotifyMask |
+                       RROutputChangeNotifyMask |
+                       RROutputPropertyNotifyMask);
+    }
 
     XSync(dpy, False);
 
@@ -140,54 +422,65 @@ int main(void)
     while (running) {
         XNextEvent(dpy, &ev);
 
+        if (have_randr &&
+            (ev.type == rr_event_base + RRScreenChangeNotify ||
+             ev.type == rr_event_base + RRNotify)) {
+            XRRUpdateConfiguration(&ev);
+            if (sync_monitors(dpy)) {
+                apply_layout(dpy);
+                focus_window(dpy, workspaces[focused_ws]);
+            }
+            continue;
+        }
+
         switch (ev.type) {
 
         case KeyPress:
+            if (sync_monitors(dpy)) {
+                apply_layout(dpy);
+                focus_window(dpy, workspaces[focused_ws]);
+            }
             handle_keypress(dpy, &ev.xkey);
             break;
 
         case MapRequest: {
+            if (sync_monitors(dpy)) {
+                apply_layout(dpy);
+                focus_window(dpy, workspaces[focused_ws]);
+            }
+
             XMapRequestEvent *e = &ev.xmaprequest;
             Window w = e->window;
 
-            int target_ws = current_ws;
+            int mon = workspace_monitor(focused_ws);
+            int target_ws = active_ws[mon];
 
             if (workspaces[target_ws] != None) {
-                int empty = find_empty_ws();
+                int empty = find_empty_ws_for_monitor(mon);
                 if (empty >= 0)
                     target_ws = empty;
             }
 
-            if (workspaces[target_ws] != None) {
+            if (workspaces[target_ws] != None)
                 XUnmapWindow(dpy, workspaces[target_ws]);
-            }
 
             workspaces[target_ws] = w;
+            active_ws[mon] = target_ws;
+            focused_ws = target_ws;
 
-            XMoveResizeWindow(dpy, w, 0, 0, sw, sh);
-            XMapWindow(dpy, w);
-            XRaiseWindow(dpy, w);
-
-            if (target_ws != current_ws) {
-                current_ws = target_ws;
-            }
-
-            XSetInputFocus(dpy, w, RevertToPointerRoot, CurrentTime);
+            apply_layout(dpy);
+            focus_window(dpy, w);
         } break;
 
         case DestroyNotify: {
             XDestroyWindowEvent *e = &ev.xdestroywindow;
-            if (e->window == workspaces[current_ws]) {
-                workspaces[current_ws] = None;
-            }
+            int ws = find_workspace_by_window(e->window);
+            if (ws >= 0)
+                workspaces[ws] = None;
         } break;
 
-        case UnmapNotify: {
-            XUnmapEvent *e = &ev.xunmap;
-            if (e->window == workspaces[current_ws]) {
-                workspaces[current_ws] = None;
-            }
-        } break;
+        case UnmapNotify:
+            break;
 
         default:
             break;

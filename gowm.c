@@ -14,6 +14,9 @@
 
 static int running = 1;
 static Window workspaces[NUM_WS];
+static Window ws_indicator = None;
+static GC ws_indicator_gc = 0;
+static XFontStruct *ws_indicator_font = NULL;
 
 /* monitor 0 = main, monitor 1 = external (when connected) */
 static int monitor_count = 1;
@@ -54,6 +57,8 @@ static void focus_window(Display *dpy, Window w)
     if (w == None) return;
     XMapRaised(dpy, w);
     XSetInputFocus(dpy, w, RevertToPointerRoot, CurrentTime);
+    if (ws_indicator != None)
+        XRaiseWindow(dpy, ws_indicator);
 }
 
 static int find_workspace_by_window(Window w)
@@ -240,6 +245,59 @@ static void ensure_active_workspaces(void)
     }
 }
 
+static void draw_ws_indicator(Display *dpy)
+{
+    if (ws_indicator == None || ws_indicator_gc == 0)
+        return;
+
+    char label[2];
+    label[0] = (char)('1' + focused_ws);
+    label[1] = '\0';
+
+    XClearWindow(dpy, ws_indicator);
+    XDrawString(dpy, ws_indicator, ws_indicator_gc, 4, 12, label, 1);
+}
+
+static void update_ws_indicator(Display *dpy)
+{
+    if (ws_indicator == None)
+        return;
+
+    int mon = workspace_monitor(focused_ws);
+    int x = monitors[mon].x + 4;
+    int y = monitors[mon].y + monitors[mon].h - 18;
+
+    XMoveWindow(dpy, ws_indicator, x, y);
+    XRaiseWindow(dpy, ws_indicator);
+    draw_ws_indicator(dpy);
+}
+
+static void create_ws_indicator(Display *dpy, Window root)
+{
+    XSetWindowAttributes attrs;
+    attrs.override_redirect = True;
+    attrs.background_pixel = BlackPixel(dpy, DefaultScreen(dpy));
+    attrs.border_pixel = BlackPixel(dpy, DefaultScreen(dpy));
+
+    ws_indicator = XCreateWindow(
+        dpy, root,
+        4, 4, 16, 16, 0,
+        CopyFromParent, InputOutput, CopyFromParent,
+        CWOverrideRedirect | CWBackPixel | CWBorderPixel,
+        &attrs);
+
+    XSelectInput(dpy, ws_indicator, ExposureMask);
+    XMapRaised(dpy, ws_indicator);
+
+    ws_indicator_gc = XCreateGC(dpy, ws_indicator, 0, NULL);
+    XSetForeground(dpy, ws_indicator_gc, WhitePixel(dpy, DefaultScreen(dpy)));
+    ws_indicator_font = XLoadQueryFont(dpy, "fixed");
+    if (ws_indicator_font)
+        XSetFont(dpy, ws_indicator_gc, ws_indicator_font->fid);
+
+    update_ws_indicator(dpy);
+}
+
 static int sync_monitors(Display *dpy)
 {
     int prev_count = monitor_count;
@@ -286,6 +344,8 @@ static void apply_layout(Display *dpy)
             XUnmapWindow(dpy, w);
         }
     }
+
+    update_ws_indicator(dpy);
 }
 
 static void center_pointer_on_monitor(Display *dpy, int mon)
@@ -385,6 +445,7 @@ int main(void)
 
     refresh_monitors(dpy);
     ensure_active_workspaces();
+    create_ws_indicator(dpy, root);
 
     XSetErrorHandler(xerror);
     XSelectInput(dpy, root,
@@ -434,6 +495,11 @@ int main(void)
         }
 
         switch (ev.type) {
+
+        case Expose:
+            if (ev.xexpose.window == ws_indicator)
+                draw_ws_indicator(dpy);
+            break;
 
         case KeyPress:
             if (sync_monitors(dpy)) {
@@ -495,6 +561,13 @@ int main(void)
     }
 
     XSync(dpy, False);
+
+    if (ws_indicator_font)
+        XFreeFont(dpy, ws_indicator_font);
+    if (ws_indicator_gc)
+        XFreeGC(dpy, ws_indicator_gc);
+    if (ws_indicator != None)
+        XDestroyWindow(dpy, ws_indicator);
 
     XCloseDisplay(dpy);
     printf("WM exited.\n");

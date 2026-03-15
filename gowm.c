@@ -61,6 +61,36 @@ static void focus_window(Display *dpy, Window w)
         XRaiseWindow(dpy, ws_indicator);
 }
 
+static void close_window(Display *dpy, Window w)
+{
+    if (w == None) return;
+
+    Atom wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
+    Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+    Atom *protocols = NULL;
+    int count = 0;
+
+    if (XGetWMProtocols(dpy, w, &protocols, &count)) {
+        for (int i = 0; i < count; i++) {
+            if (protocols[i] == wm_delete) {
+                XEvent ev = {0};
+                ev.xclient.type = ClientMessage;
+                ev.xclient.window = w;
+                ev.xclient.message_type = wm_protocols;
+                ev.xclient.format = 32;
+                ev.xclient.data.l[0] = wm_delete;
+                ev.xclient.data.l[1] = CurrentTime;
+                XSendEvent(dpy, w, False, NoEventMask, &ev);
+                XFree(protocols);
+                return;
+            }
+        }
+        XFree(protocols);
+    }
+
+    XDestroyWindow(dpy, w);
+}
+
 static int find_workspace_by_window(Window w)
 {
     for (int i = 0; i < NUM_WS; i++) {
@@ -401,11 +431,7 @@ static void handle_keypress(Display *dpy, XKeyEvent *ke)
 
     if (sym == XK_q && (st & ControlMask) && (st & ShiftMask)) {
         Window w = workspaces[focused_ws];
-        if (w != None) {
-            XKillClient(dpy, w);
-            workspaces[focused_ws] = None;
-            apply_layout(dpy);
-        }
+        close_window(dpy, w);
         return;
     }
 

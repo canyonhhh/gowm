@@ -42,7 +42,7 @@ static int xerror(Display *dpy, XErrorEvent *ee)
 
 static int is_external_workspace(int ws)
 {
-    return ws == 0 || ws == 7 || ws == 8;
+    return ws >= 0 && ws <= 5;
 }
 
 static int workspace_monitor(int ws)

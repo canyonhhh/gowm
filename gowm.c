@@ -544,6 +544,10 @@ int main(void)
             XMapRequestEvent *e = &ev.xmaprequest;
             Window w = e->window;
 
+            int existing = find_workspace_by_window(w);
+            if (existing >= 0)
+                workspaces[existing] = None;
+
             int mon = workspace_monitor(focused_ws);
             int target_ws = active_ws[mon];
 
@@ -571,8 +575,14 @@ int main(void)
                 workspaces[ws] = None;
         } break;
 
-        case UnmapNotify:
-            break;
+        case UnmapNotify: {
+            XUnmapEvent *e = &ev.xunmap;
+            if (e->send_event) {
+                int ws = find_workspace_by_window(e->window);
+                if (ws >= 0)
+                    workspaces[ws] = None;
+            }
+        } break;
 
         default:
             break;

@@ -52,6 +52,16 @@ static int workspace_monitor(int ws)
     return 0;
 }
 
+static int monitor_at(int x, int y)
+{
+    for (int i = 0; i < monitor_count; i++) {
+        if (x >= monitors[i].x && x < monitors[i].x + monitors[i].w &&
+            y >= monitors[i].y && y < monitors[i].y + monitors[i].h)
+            return i;
+    }
+    return -1;
+}
+
 static void focus_window(Display *dpy, Window w)
 {
     if (w == None) return;
@@ -386,6 +396,20 @@ static void center_pointer_on_monitor(Display *dpy, int mon)
     XWarpPointer(dpy, None, root, 0, 0, 0, 0, cx, cy);
 }
 
+static void focus_monitor(Display *dpy, int mon)
+{
+    if (monitor_count < 2)
+        return;
+    if (mon < 0 || mon >= monitor_count)
+        return;
+    if (mon == workspace_monitor(focused_ws))
+        return;
+
+    focused_ws = active_ws[mon];
+    focus_window(dpy, workspaces[focused_ws]);
+    update_ws_indicator(dpy);
+}
+
 static void switch_ws(Display *dpy, int target)
 {
     int prev_mon = workspace_monitor(focused_ws);
@@ -475,7 +499,7 @@ int main(void)
 
     XSetErrorHandler(xerror);
     XSelectInput(dpy, root,
-        SubstructureRedirectMask | SubstructureNotifyMask);
+        SubstructureRedirectMask | SubstructureNotifyMask | EnterWindowMask);
 
     have_randr = XRRQueryExtension(dpy, &rr_event_base, &rr_error_base);
     if (have_randr) {
@@ -544,6 +568,8 @@ int main(void)
             XMapRequestEvent *e = &ev.xmaprequest;
             Window w = e->window;
 
+            XSelectInput(dpy, w, EnterWindowMask);
+
             int existing = find_workspace_by_window(w);
             if (existing >= 0)
                 workspaces[existing] = None;
@@ -566,6 +592,15 @@ int main(void)
 
             apply_layout(dpy);
             focus_window(dpy, w);
+        } break;
+
+        case EnterNotify: {
+            XCrossingEvent *e = &ev.xcrossing;
+            if (e->mode != NotifyNormal || e->detail == NotifyInferior)
+                break;
+            if (e->window == ws_indicator)
+                break;
+            focus_monitor(dpy, monitor_at(e->x_root, e->y_root));
         } break;
 
         case DestroyNotify: {

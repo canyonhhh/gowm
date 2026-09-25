@@ -277,7 +277,7 @@ static void ensure_active_workspaces(void)
 {
     if (monitor_count >= 2) {
         if (workspace_monitor(active_ws[0]) != 0)
-            active_ws[0] = 1;
+            active_ws[0] = 6;
         if (workspace_monitor(active_ws[1]) != 1)
             active_ws[1] = 0;
     } else {

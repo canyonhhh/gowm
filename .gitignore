@@ -1,2 +1,3 @@
-gowm
+/gowm
+/tests/test-workspace
 compile_commands.json

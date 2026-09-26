@@ -1,7 +1,11 @@
 #include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <X11/Xft/Xft.h>
 #include <X11/keysym.h>
 #include <X11/extensions/Xinerama.h>
 #include <X11/extensions/Xrandr.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +21,17 @@ static Window workspaces[NUM_WS];
 static Window ws_indicator = None;
 static GC ws_indicator_gc = 0;
 static XFontStruct *ws_indicator_font = NULL;
+
+static Window overview = None;
+static GC overview_gc = 0;
+static XftDraw *overview_draw = NULL;
+static XftFont *overview_font = NULL;
+static int overview_visible = 0;
+static int overview_width, overview_height;
+static XftColor overview_text;
+static Atom net_wm_name, utf8_string;
+
+static void update_overview(Display *dpy);
 
 /* monitor 0 = main, monitor 1 = external (when connected) */
 static int monitor_count = 1;
@@ -64,7 +79,14 @@ static int monitor_at(int x, int y)
 
 static void focus_window(Display *dpy, Window w)
 {
-    if (w == None) return;
+    if (overview_visible) {
+        XRaiseWindow(dpy, overview);
+        return;
+    }
+    if (w == None) {
+        XSetInputFocus(dpy, DefaultRootWindow(dpy), RevertToPointerRoot, CurrentTime);
+        return;
+    }
     XMapRaised(dpy, w);
     XSetInputFocus(dpy, w, RevertToPointerRoot, CurrentTime);
     if (ws_indicator != None)
@@ -386,6 +408,7 @@ static void apply_layout(Display *dpy)
     }
 
     update_ws_indicator(dpy);
+    update_overview(dpy);
 }
 
 static void center_pointer_on_monitor(Display *dpy, int mon)
@@ -398,6 +421,8 @@ static void center_pointer_on_monitor(Display *dpy, int mon)
 
 static void focus_monitor(Display *dpy, int mon)
 {
+    if (overview_visible)
+        return;
     if (monitor_count < 2)
         return;
     if (mon < 0 || mon >= monitor_count)
@@ -448,10 +473,237 @@ static void move_window_to_ws(Display *dpy, int target)
         active_ws[src_mon] = src_ws;
 }
 
+static void create_overview(Display *dpy, Window root)
+{
+    unsigned long black = BlackPixel(dpy, DefaultScreen(dpy));
+    unsigned long white = WhitePixel(dpy, DefaultScreen(dpy));
+    overview_text = (XftColor){white, {65535, 65535, 65535, 65535}};
+
+    XSetWindowAttributes attrs = {0};
+    attrs.override_redirect = True;
+    attrs.background_pixel = black;
+    attrs.event_mask = ExposureMask | KeyPressMask;
+    overview = XCreateWindow(dpy, root, 0, 0, 1, 1, 0,
+                             CopyFromParent, InputOutput, CopyFromParent,
+                             CWOverrideRedirect | CWBackPixel | CWEventMask, &attrs);
+    XStoreName(dpy, overview, "gowm workspace overview");
+    overview_gc = XCreateGC(dpy, overview, 0, NULL);
+    int screen = DefaultScreen(dpy);
+    overview_draw = XftDrawCreate(dpy, overview, DefaultVisual(dpy, screen),
+                                  DefaultColormap(dpy, screen));
+    overview_font = XftFontOpenName(dpy, screen, "sans:pixelsize=18");
+    if (!overview_font || !overview_draw)
+        fprintf(stderr, "cannot initialize workspace overview text rendering\n");
+    net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+    utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
+}
+
+static int overview_text_width(Display *dpy, const char *text, int length)
+{
+    XGlyphInfo extents;
+    XftTextExtentsUtf8(dpy, overview_font, (const FcChar8 *)text, length, &extents);
+    return extents.xOff;
+}
+
+/* Fit labels by pixel width, removing whole UTF-8 characters when shortening. */
+static void overview_label(Display *dpy, int x, int y, int width,
+                           const char *text)
+{
+    if (width <= 0 || !overview_font)
+        return;
+    char label[1024];
+    size_t bytes = strlen(text);
+    if (bytes > sizeof(label) - 4) {
+        bytes = sizeof(label) - 4;
+        while (bytes > 0 && ((unsigned char)text[bytes] & 0xc0) == 0x80)
+            bytes--;
+    }
+    memcpy(label, text, bytes);
+    label[bytes] = '\0';
+    for (char *p = label; *p; p++) {
+        if ((unsigned char)*p < 32 || *p == 127)
+            *p = ' ';
+    }
+    int len = (int)strlen(label);
+    int dots = overview_text_width(dpy, "...", 3);
+    if (overview_text_width(dpy, label, len) > width) {
+        if (width < dots)
+            return;
+        do {
+            do { len--; } while (len > 0 && (label[len] & 0xc0) == 0x80);
+        } while (len > 0 &&
+                 overview_text_width(dpy, label, len) + dots > width);
+        memcpy(label + len, "...", 4);
+        len += 3;
+    }
+    XftDrawStringUtf8(overview_draw, &overview_text, overview_font,
+                      x, y, (const FcChar8 *)label, len);
+}
+
+static void window_title(Display *dpy, Window w, char *title, size_t size)
+{
+    Atom type;
+    int format;
+    unsigned long count, remaining;
+    unsigned char *value = NULL;
+    title[0] = '\0';
+    if (XGetWindowProperty(dpy, w, net_wm_name, 0, 1024, False,
+                           utf8_string, &type, &format, &count, &remaining,
+                           &value) == Success && value && type == utf8_string &&
+        format == 8 && count > 0 && value[0]) {
+        snprintf(title, size, "%s", (char *)value);
+        XFree(value);
+        return;
+    }
+    if (value)
+        XFree(value);
+
+    XTextProperty property = {0};
+    if (XGetWMName(dpy, w, &property) && property.value) {
+        char **list = NULL;
+        int n = 0;
+        if (Xutf8TextPropertyToTextList(dpy, &property, &list, &n) >= Success &&
+            list && n > 0 && list[0][0])
+            snprintf(title, size, "%s", list[0]);
+        if (list)
+            XFreeStringList(list);
+        XFree(property.value);
+    }
+}
+
+static void draw_overview(Display *dpy)
+{
+    if (!overview_visible || !overview_font)
+        return;
+
+    XClearWindow(dpy, overview);
+    int margin = overview_width / 24;
+    if (margin < 8) margin = 8;
+    int gap = overview_width / 64;
+    if (gap < 8) gap = 8;
+    if (gap > 20) gap = 20;
+    int width = overview_width - 2 * margin;
+    if (width > 1320) width = 1320;
+    int height = overview_height - 120;
+    if (height > 810) height = 810;
+    if (width < 90 || height < 90)
+        return;
+    int left = (overview_width - width) / 2;
+    int top = (overview_height - height) / 2;
+    int card_w = (width - 2 * gap) / 3;
+    int card_h = (height - 2 * gap) / 3;
+
+    XSetForeground(dpy, overview_gc, overview_text.pixel);
+    for (int ws = 0; ws < NUM_WS; ws++) {
+        int x = left + (ws % 3) * (card_w + gap);
+        int y = top + (ws / 3) * (card_h + gap);
+        XSetLineAttributes(dpy, overview_gc, ws == focused_ws ? 3 : 1,
+                           LineSolid, CapButt, JoinMiter);
+        XDrawRectangle(dpy, overview, overview_gc, x + 1, y + 1,
+                       card_w - 3, card_h - 3);
+        XSetLineAttributes(dpy, overview_gc, 1, LineSolid, CapButt, JoinMiter);
+
+        char number[2] = {(char)('1' + ws), '\0'};
+        overview_label(dpy, x + 16, y + 29, card_w - 32, number);
+        if (workspaces[ws] == None || card_h < 85 || card_w < 64)
+            continue;
+
+        XClassHint app = {0};
+        XGetClassHint(dpy, workspaces[ws], &app);
+        const char *name = app.res_class && app.res_class[0] ? app.res_class :
+                           app.res_name && app.res_name[0] ? app.res_name : "";
+        int baseline = y + card_h / 2;
+        overview_label(dpy, x + 16, baseline, card_w - 32, name);
+        char title[1024];
+        window_title(dpy, workspaces[ws], title, sizeof(title));
+        overview_label(dpy, x + 16, baseline + 25, card_w - 32, title);
+        if (app.res_name) XFree(app.res_name);
+        if (app.res_class) XFree(app.res_class);
+    }
+}
+
+static void update_overview(Display *dpy)
+{
+    if (!overview_visible)
+        return;
+    struct monitor_geo *mon = &monitors[workspace_monitor(focused_ws)];
+    overview_width = mon->w;
+    overview_height = mon->h;
+    XMoveResizeWindow(dpy, overview, mon->x, mon->y, mon->w, mon->h);
+    XRaiseWindow(dpy, overview);
+    draw_overview(dpy);
+}
+
+static void show_overview(Display *dpy)
+{
+    if (overview_visible || !overview_font || !overview_draw)
+        return;
+    overview_visible = 1;
+    update_overview(dpy);
+    XMapRaised(dpy, overview);
+    /* owner_events=False routes even unmodified keys to this modal window. */
+    if (XGrabKeyboard(dpy, overview, False, GrabModeAsync, GrabModeAsync,
+                      CurrentTime) != GrabSuccess) {
+        overview_visible = 0;
+        XUnmapWindow(dpy, overview);
+        return;
+    }
+    /* Don't let clicks reach applications on another monitor while choosing. */
+    if (XGrabPointer(dpy, overview, False, ButtonPressMask | ButtonReleaseMask,
+                     GrabModeAsync, GrabModeAsync, None, None, CurrentTime) != GrabSuccess) {
+        XUngrabKeyboard(dpy, CurrentTime);
+        overview_visible = 0;
+        XUnmapWindow(dpy, overview);
+        return;
+    }
+    XSetInputFocus(dpy, overview, RevertToPointerRoot, CurrentTime);
+}
+
+static void hide_overview(Display *dpy)
+{
+    if (!overview_visible)
+        return;
+    overview_visible = 0;
+    XUngrabKeyboard(dpy, CurrentTime);
+    XUngrabPointer(dpy, CurrentTime);
+    XUnmapWindow(dpy, overview);
+    focus_window(dpy, workspaces[focused_ws]);
+}
+
+static void handle_overview_key(Display *dpy, KeySym sym)
+{
+    int target = -1;
+    if (sym >= XK_1 && sym <= XK_9)
+        target = (int)(sym - XK_1);
+    else if (sym >= XK_KP_1 && sym <= XK_KP_9)
+        target = (int)(sym - XK_KP_1);
+    else if (sym == XK_Escape) {
+        hide_overview(dpy);
+        return;
+    }
+
+    if (target >= 0) {
+        hide_overview(dpy);
+        switch_ws(dpy, target);
+    }
+}
+
 static void handle_keypress(Display *dpy, XKeyEvent *ke)
 {
-    const KeySym sym = XLookupKeysym(ke, 0);
+    KeySym sym = XLookupKeysym(ke, 0);
     const unsigned int st = ke->state;
+
+    if (overview_visible) {
+        char text[32];
+        XLookupString(ke, text, sizeof(text), &sym, NULL);
+        handle_overview_key(dpy, sym);
+        return;
+    }
+
+    if (sym == XK_w && (st & ControlMask) && !(st & (ShiftMask | Mod1Mask | Mod4Mask))) {
+        show_overview(dpy);
+        return;
+    }
 
     if (sym == XK_q && (st & ControlMask) && (st & ShiftMask)) {
         Window w = workspaces[focused_ws];
@@ -482,6 +734,8 @@ int main(void)
     int rr_error_base = 0;
     int have_randr = 0;
 
+    setlocale(LC_CTYPE, "");
+    XSetLocaleModifiers("");
     dpy = XOpenDisplay(NULL);
     if (!dpy) {
         fprintf(stderr, "cannot open display\n");
@@ -496,6 +750,7 @@ int main(void)
     refresh_monitors(dpy);
     ensure_active_workspaces();
     create_ws_indicator(dpy, root);
+    create_overview(dpy, root);
 
     XSetErrorHandler(xerror);
     XSelectInput(dpy, root,
@@ -511,6 +766,25 @@ int main(void)
     }
 
     XSync(dpy, False);
+
+    /* Keep Ctrl+W usable with Caps Lock and Num Lock enabled. */
+    unsigned int numlock_mask = 0;
+    XModifierKeymap *modifiers = XGetModifierMapping(dpy);
+    KeyCode numlock = XKeysymToKeycode(dpy, XK_Num_Lock);
+    if (modifiers) {
+        for (int mod = 0; mod < 8; mod++) {
+            for (int key = 0; key < modifiers->max_keypermod; key++) {
+                if (numlock && modifiers->modifiermap[mod * modifiers->max_keypermod + key] == numlock)
+                    numlock_mask |= 1U << mod;
+            }
+        }
+        XFreeModifiermap(modifiers);
+    }
+    unsigned int locks[] = {0, LockMask, numlock_mask, LockMask | numlock_mask};
+    KeyCode overview_key = XKeysymToKeycode(dpy, XK_w);
+    for (unsigned int i = 0; i < sizeof(locks) / sizeof(locks[0]); i++)
+        XGrabKey(dpy, overview_key, ControlMask | locks[i],
+                 root, True, GrabModeAsync, GrabModeAsync);
 
     KeyCode q = XKeysymToKeycode(dpy, XK_Q);
     XGrabKey(dpy, q, ControlMask | ShiftMask,
@@ -549,6 +823,8 @@ int main(void)
         case Expose:
             if (ev.xexpose.window == ws_indicator)
                 draw_ws_indicator(dpy);
+            else if (ev.xexpose.window == overview && ev.xexpose.count == 0)
+                draw_overview(dpy);
             break;
 
         case KeyPress:
@@ -568,7 +844,7 @@ int main(void)
             XMapRequestEvent *e = &ev.xmaprequest;
             Window w = e->window;
 
-            XSelectInput(dpy, w, EnterWindowMask);
+            XSelectInput(dpy, w, EnterWindowMask | PropertyChangeMask);
 
             int existing = find_workspace_by_window(w);
             if (existing >= 0)
@@ -587,8 +863,10 @@ int main(void)
                 XUnmapWindow(dpy, workspaces[target_ws]);
 
             workspaces[target_ws] = w;
-            active_ws[mon] = target_ws;
-            focused_ws = target_ws;
+            if (!overview_visible) {
+                active_ws[mon] = target_ws;
+                focused_ws = target_ws;
+            }
 
             apply_layout(dpy);
             focus_window(dpy, w);
@@ -598,7 +876,7 @@ int main(void)
             XCrossingEvent *e = &ev.xcrossing;
             if (e->mode != NotifyNormal || e->detail == NotifyInferior)
                 break;
-            if (e->window == ws_indicator)
+            if (overview_visible || e->window == ws_indicator || e->window == overview)
                 break;
             focus_monitor(dpy, monitor_at(e->x_root, e->y_root));
         } break;
@@ -606,16 +884,27 @@ int main(void)
         case DestroyNotify: {
             XDestroyWindowEvent *e = &ev.xdestroywindow;
             int ws = find_workspace_by_window(e->window);
-            if (ws >= 0)
+            if (ws >= 0) {
                 workspaces[ws] = None;
+                draw_overview(dpy);
+            }
         } break;
+
+        case PropertyNotify:
+            if (find_workspace_by_window(ev.xproperty.window) >= 0 &&
+                (ev.xproperty.atom == net_wm_name || ev.xproperty.atom == XA_WM_NAME ||
+                 ev.xproperty.atom == XA_WM_CLASS))
+                draw_overview(dpy);
+            break;
 
         case UnmapNotify: {
             XUnmapEvent *e = &ev.xunmap;
             if (e->send_event) {
                 int ws = find_workspace_by_window(e->window);
-                if (ws >= 0)
+                if (ws >= 0) {
                     workspaces[ws] = None;
+                    draw_overview(dpy);
+                }
             }
         } break;
 
@@ -623,6 +912,16 @@ int main(void)
             break;
         }
     }
+
+    hide_overview(dpy);
+    if (overview_font)
+        XftFontClose(dpy, overview_font);
+    if (overview_draw)
+        XftDrawDestroy(overview_draw);
+    if (overview_gc)
+        XFreeGC(dpy, overview_gc);
+    if (overview != None)
+        XDestroyWindow(dpy, overview);
 
     for (int i = 0; i < NUM_WS; i++) {
         if (workspaces[i] != None) {
